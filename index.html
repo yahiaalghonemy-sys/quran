@@ -52,6 +52,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--frame);outline-
 .ay{border-radius:6px;transition:background .3s;cursor:pointer}
 .ay.cur{background:var(--mark)}
 .num{color:var(--frame);white-space:nowrap}
+.live{display:flex;align-items:center;gap:8px;background:var(--paper);border-bottom:1px solid var(--line);font-size:14px;color:var(--ink);padding-block:6px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.live span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.lvl{flex:none;width:10px;height:10px;border-radius:50%;background:var(--line)}
+.lvl.hear{background:var(--live)}
 .loading{margin:auto;color:var(--muted);font-size:16px;text-align:center;line-height:1.8}
 
 .test{background:var(--bar);border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;
@@ -75,6 +79,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--frame);outline-
   </div>
 </header>
 
+<div class="live" id="live" hidden><span class="lvl" id="lvl"></span><span id="liveTxt">مستني صوت…</span></div>
 <main class="stage" id="stage"><p class="loading" id="loading">جاري تحميل المصحف…</p></main>
 
 <section class="test" id="test" hidden>
@@ -154,14 +159,19 @@ var Engine = (function () {
         votes.set(b, (votes.get(b) || 0) + w);
       }
     }
-    var best = null, bestScore = 0;
+    var best = null, bestScore = 0, scores = [];
     votes.forEach(function (v, b) {
       var s = v + (votes.get(b - 1) || 0) * 0.8 + (votes.get(b + 1) || 0) * 0.8;
       var startChar = b << 3;
       if (near != null && startChar > near - 400 && startChar < near + 4000) s *= 1.6;
+      scores.push([b, s]);
       if (s > bestScore) { bestScore = s; best = b; }
     });
     if (best === null) return null;
+    // أقوى منافس بعيد عن أفضل موضع، عشان نعرف المطابقة واضحة ولا لأ
+    var second = 0;
+    for (var i = 0; i < scores.length; i++)
+      if (Math.abs(scores[i][0] - best) > 3 && scores[i][1] > second) second = scores[i][1];
     // الثقة = النسبة من أقصى نتيجة ممكنة لو كل الـ grams نادرة ومتطابقة
     var conf = bestScore / (grams * 0.5);
     var endChar = Math.min((best << 3) + q.length, db.text.length - 1);
@@ -172,7 +182,7 @@ var Engine = (function () {
         if (Math.abs(occT[t] + N - 1 - endChar) < 24) { endChar = occT[t] + N - 1; break; }
       }
     }
-    return { ayah: db.owner[endChar], char: endChar, conf: conf };
+    return { ayah: db.owner[endChar], char: endChar, conf: conf, margin: second ? bestScore / second : 99 };
   }
 
   return { norm: norm, build: build, locate: locate };
@@ -302,7 +312,8 @@ function boot(DATA){
     var r = Engine.locate(db, text, near);
     if(!r) return false;
     var nearHit = near!=null && r.char > near-400 && r.char < near+4000;
-    if(r.conf < (nearHit ? 0.24 : 0.28)) { if(!fromSpeech) statusEl.textContent='مش لاقي الآية دي — جرّب كلمات أكتر'; return false; }
+    var good = r.conf >= (nearHit ? 0.24 : 0.28) || (r.conf >= (nearHit ? 0.13 : 0.15) && r.margin >= 1.8);
+    if(!good) { if(!fromSpeech) statusEl.textContent='مش لاقي الآية دي — جرّب كلمات أكتر'; return false; }
     if(A[r.ayah][0] === 1){ statusEl.textContent='الإمام بيقرأ الفاتحة… في انتظار السورة'; return 'fatiha'; }
     setAyah(r.ayah, fromSpeech);
     return true;
@@ -334,51 +345,69 @@ function boot(DATA){
   var inFrame = (function(){ try{ return window.self !== window.top; }catch(_){ return true; } })();
   var watchdog=null, started=false;
 
+  var liveEl=document.getElementById('live'), liveTxt=document.getElementById('liveTxt'), lvl=document.getElementById('lvl');
+  var isAndroid=/Android/i.test(navigator.userAgent), silent=0, gotAny=false, restartT=null;
+
   function startRec(){
-    // رد فعل فوري عشان المستخدم يعرف إن الزرار اشتغل
     btnTxt.textContent='بيجهّز الميكروفون…';
     statusEl.textContent='لو ظهر طلب إذن للميكروفون اختار «سماح»';
-    if(inFrame){ noMic('الميكروفون مقفول جوّه تطبيق Claude — افتح ملف البرنامج في Chrome'); return; }
+    if(inFrame){ noMic('الميكروفون مقفول جوّه تطبيق Claude — افتح البرنامج من لينك github في Chrome'); return; }
     if(!SR){ noMic('المتصفح ده مش بيدعم التعرّف على الصوت — افتحه في Chrome'); return; }
-    started=false;
-    rec = new SR(); rec.lang='ar-SA'; rec.continuous=true; rec.interimResults=true; rec.maxAlternatives=1;
+    started=false; silent=0; gotAny=false; buffer='';
+    listening=true;
+    liveEl.hidden=false; liveTxt.textContent='بيفتح الميكروفون…'; render();
+    begin();
+    watchdog=setTimeout(function(){
+      if(started) return;
+      stopRec();
+      noMic('الميكروفون ما اشتغلش — اتأكد إن Chrome واخد إذن الميكروفون');
+    },6000);
+    if(navigator.wakeLock) navigator.wakeLock.request('screen').then(function(w){ wake=w; }).catch(function(){});
+  }
+
+  // جلسة تعرّف واحدة. على أندرويد الوضع المستمر مش ثابت، فبنعمل جلسات قصيرة ورا بعض
+  function begin(){
+    rec = new SR(); rec.lang='ar-SA'; rec.continuous=!isAndroid; rec.interimResults=true; rec.maxAlternatives=1;
     rec.onstart=function(){
       started=true; clearTimeout(watchdog);
       btn.classList.add('on'); btnTxt.textContent='بيستمع… اضغط للإيقاف';
-      statusEl.textContent='بيستمع للإمام';
+      if(!gotAny) liveTxt.textContent='الميكروفون شغّال — مستني صوت الإمام';
     };
+    rec.onspeechstart=function(){ lvl.classList.add('hear'); if(!gotAny) liveTxt.textContent='سامع صوت… بيحوّله لكلام'; };
+    rec.onspeechend=function(){ lvl.classList.remove('hear'); };
     rec.onresult=function(e){
+      silent=0; gotAny=true;
       var interim='';
       for(var i=e.resultIndex;i<e.results.length;i++){
         var t=e.results[i][0].transcript;
         if(e.results[i].isFinal) buffer=(buffer+' '+t).slice(-220); else interim+=' '+t;
       }
       var all=(buffer+' '+interim).trim();
+      liveTxt.textContent='سمعت: '+all.slice(-90);
       heardEl.textContent='سمعت: '+all.slice(-80);
       var now=Date.now(); if(now-lastRun<350) return; lastRun=now;
-      if(handle(all.slice(-120),true)==='fatiha') buffer='';
+      var r=handle(all.slice(-120),true);
+      if(r==='fatiha') buffer='';
     };
     rec.onerror=function(e){
-      clearTimeout(watchdog);
-      if(e.error==='not-allowed'||e.error==='service-not-allowed')
-        noMic(location.protocol==='file:' ? 'Chrome رافض الميكروفون للملف المفتوح من الجهاز — محتاج يتفتح من لينك https' : 'إذن الميكروفون مرفوض — اسمح بيه من إعدادات الموقع في Chrome');
-      else if(e.error==='audio-capture') noMic('مش لاقي ميكروفون شغّال على الجهاز');
-      else if(e.error==='network') statusEl.textContent='التعرّف على الصوت محتاج إنترنت في النسخة دي';
-      else if(e.error!=='no-speech' && e.error!=='aborted') statusEl.textContent='مشكلة في الاستماع ('+e.error+') — بيحاول تاني';
+      if(e.error==='not-allowed'||e.error==='service-not-allowed'){ clearTimeout(watchdog); stopRec();
+        noMic('إذن الميكروفون مرفوض — من القفل جنب اللينك في Chrome ← الأذونات ← الميكروفون ← سماح'); }
+      else if(e.error==='audio-capture'){ clearTimeout(watchdog); stopRec(); noMic('الميكروفون مشغول — اقفل أي تطبيق تاني بيستخدمه وجرّب تاني'); }
+      else if(e.error==='network') liveTxt.textContent='مفيش إنترنت — التعرّف على الصوت في النسخة دي محتاج نت';
+      else if(e.error==='no-speech'){ silent++; if(silent>=2) liveTxt.textContent='مش سامع كلام واضح — قرّب الموبايل من السماعة'; }
+      else if(e.error!=='aborted') liveTxt.textContent='مشكلة في الاستماع ('+e.error+') — بيحاول تاني';
     };
-    rec.onend=function(){ if(listening){ try{ rec.start(); }catch(_){} } };
-    try{ rec.start(); }catch(err){ noMic('مش قادر أشغّل الميكروفون'); return; }
-    listening=true;
-    // لو مفيش أي رد خلال ٥ ثواني، نقول السبب بدل ما الزرار يبان واقف
-    watchdog=setTimeout(function(){
-      if(started) return;
-      try{ rec.stop(); }catch(_){}
-      noMic('الميكروفون ما اشتغلش — افتح البرنامج في Chrome من لينك https');
-    },5000);
-    if(navigator.wakeLock) navigator.wakeLock.request('screen').then(function(w){ wake=w; }).catch(function(){});
+    rec.onend=function(){
+      lvl.classList.remove('hear');
+      if(!listening) return;
+      clearTimeout(restartT);
+      restartT=setTimeout(function(){ if(listening){ try{ begin(); }catch(_){} } }, 250);
+    };
+    try{ rec.start(); }catch(err){ liveTxt.textContent='بيحاول يشغّل الميكروفون تاني…'; }
   }
   function stopRec(){
-    clearTimeout(watchdog); listening=false; if(rec) try{ rec.stop(); }catch(_){}
+    clearTimeout(watchdog); clearTimeout(restartT); listening=false; if(rec) try{ rec.abort(); }catch(_){}
+    liveEl.hidden=true; lvl.classList.remove('hear');
     btn.classList.remove('on'); btnTxt.textContent='ابدأ الاستماع'; statusEl.textContent='الاستماع متوقف';
     if(wake){ wake.release().catch(function(){}); wake=null; }
   }
